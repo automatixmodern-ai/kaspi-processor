@@ -1,0 +1,38 @@
+name: Kaspi Receipt Processor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"      # every 15 minutes (UTC)
+  workflow_dispatch: {}          # manual "Run workflow" button
+
+concurrency:
+  group: kaspi-processor
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Poppler (for PDF -> image)
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run processor
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GCP_API_KEY: ${{ secrets.GCP_API_KEY }}
+          SUBJECT_KEYWORD: ${{ vars.SUBJECT_KEYWORD || 'Kaspi' }}
+          CONF_THRESHOLD: ${{ vars.CONF_THRESHOLD || '0.5' }}
+        run: python src/main.py
