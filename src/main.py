@@ -28,6 +28,7 @@ from email.header import decode_header, make_header
 from email.utils import parseaddr
 from datetime import datetime
 
+import requests
 import openpyxl
 from openpyxl.styles import Font
 
@@ -36,6 +37,7 @@ from parser import parse_document
 # ---- Config (via environment / GitHub Secrets) -----------------------------
 GMAIL_USER = os.environ["GMAIL_USER"]           # e.g. automatixmodern@gmail.com
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]   # 16-char app password
+GCP_API_KEY = os.environ.get("GCP_API_KEY", "")        # also used to download Drive files
 SUBJECT_KEYWORD = os.environ.get("SUBJECT_KEYWORD", "Kaspi")
 CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.5"))  # flag fields below this
 
@@ -56,6 +58,82 @@ def _decode(s):
 
 def is_junk(name):
     return ("__MACOSX" in name) or re.search(r'(^|/)\.', name) or name.endswith("/")
+
+
+# ---- Google Drive link handling -------------------------------------------
+# Matches the common Drive URL shapes and captures the file ID:
+#   https://drive.google.com/file/d/<ID>/view?usp=sharing
+#   https://drive.google.com/open?id=<ID>
+#   https://drive.google.com/uc?id=<ID>&export=download
+#   https://docs.google.com/.../d/<ID>/...
+DRIVE_ID_PATTERNS = [
+    re.compile(r'drive\.google\.com/file/d/([A-Za-z0-9_-]{20,})'),
+    re.compile(r'drive\.google\.com/open\?id=([A-Za-z0-9_-]{20,})'),
+    re.compile(r'drive\.google\.com/uc\?[^"\s]*id=([A-Za-z0-9_-]{20,})'),
+    re.compile(r'docs\.google\.com/[^"\s]*/d/([A-Za-z0-9_-]{20,})'),
+]
+
+
+def _get_email_text(msg):
+    """Concatenate all text/plain and text/html body parts into one string."""
+    chunks = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        if part.get_filename():           # skip attachments
+            continue
+        ctype = part.get_content_type()
+        if ctype in ("text/plain", "text/html"):
+            payload = part.get_payload(decode=True)
+            if payload:
+                try:
+                    chunks.append(payload.decode(part.get_content_charset() or "utf-8",
+                                                 errors="replace"))
+                except Exception:
+                    chunks.append(payload.decode("utf-8", errors="replace"))
+    return "\n".join(chunks)
+
+
+def find_drive_file_ids(text):
+    """Return a de-duplicated list of Drive file IDs found in the email body."""
+    ids = []
+    for pat in DRIVE_ID_PATTERNS:
+        for m in pat.findall(text or ""):
+            if m not in ids:
+                ids.append(m)
+    return ids
+
+
+def download_drive_file(file_id):
+    """
+    Download a Drive file shared as 'Anyone with the link' using the API key.
+    Returns (filename, bytes). Raises RuntimeError with a clear message on failure.
+    """
+    if not GCP_API_KEY:
+        raise RuntimeError("No GCP_API_KEY set for Drive download.")
+
+    # 1) get the real filename (nice-to-have; falls back to the ID)
+    fname = f"{file_id}.zip"
+    try:
+        meta = requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            params={"key": GCP_API_KEY, "fields": "name,size"}, timeout=60)
+        if meta.status_code == 200:
+            fname = meta.json().get("name", fname)
+    except Exception:
+        pass
+
+    # 2) download the bytes
+    r = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+        params={"key": GCP_API_KEY, "alt": "media"}, timeout=600, stream=True)
+    if r.status_code == 403:
+        raise RuntimeError("DRIVE_FORBIDDEN: the file is not shared as "
+                           "'Anyone with the link' (or Drive API/key not permitted).")
+    if r.status_code == 404:
+        raise RuntimeError("DRIVE_NOT_FOUND: the Drive link/file ID is invalid.")
+    r.raise_for_status()
+    return fname, r.content
 
 
 # ---- Excel builder ---------------------------------------------------------
@@ -100,29 +178,85 @@ def build_excel(kaspi_rows, nokaspi_rows, total_docs, excluded, out_path):
 
 
 # ---- Process one email -----------------------------------------------------
+ZIP_CONTENT_TYPES = {
+    "application/zip", "application/x-zip-compressed", "application/x-zip",
+    "application/octet-stream",   # some clients send zips as this
+    "multipart/x-zip",
+}
+
+
+def _looks_like_zip(filename, content_type, payload):
+    """True if this attachment is a zip, by name, MIME type, or magic bytes."""
+    name = (filename or "").lower()
+    if name.endswith(".zip"):
+        return True
+    if (content_type or "").lower() in ZIP_CONTENT_TYPES:
+        # confirm with the zip magic number to avoid false positives on octet-stream
+        if payload and payload[:2] == b"PK":
+            return True
+    # last resort: any attachment whose bytes start with the zip signature
+    if payload and payload[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
+        return True
+    return False
+
+
 def process_message(raw_bytes):
-    """Returns (result_dict) or None if the message has no zip to act on."""
+    """Returns a result_dict, or None if the message has no zip to act on."""
     msg = email.message_from_bytes(raw_bytes)
     sender_name, sender_addr = parseaddr(msg.get("From", ""))
     subject = _decode(msg.get("Subject", ""))
 
-    # collect zip attachments
+    # collect ALL zip attachments (there may be several — one per folder)
     zips = []
     for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
         fn = part.get_filename()
-        if fn and _decode(fn).lower().endswith(".zip"):
-            payload = part.get_payload(decode=True)
-            if payload:
-                zips.append((_decode(fn), payload))
+        if fn is None:
+            continue
+        fn = _decode(fn)
+        payload = part.get_payload(decode=True)
+        ctype = part.get_content_type()
+        if payload and _looks_like_zip(fn, ctype, payload):
+            zips.append((fn, payload))
+            print(f"    zip attachment: {fn!r} ({ctype}, {len(payload)} bytes)")
+        elif fn:
+            print(f"    (skipped non-zip attachment: {fn!r} [{ctype}])")
+
+    print(f"  Found {len(zips)} zip attachment(s) on this email.")
+
+    # Also handle Google Drive links in the body (for files too big to attach).
+    drive_errors = []
+    body_text = _get_email_text(msg)
+    file_ids = find_drive_file_ids(body_text)
+    if file_ids:
+        print(f"  Found {len(file_ids)} Google Drive link(s) in the body.")
+    for fid in file_ids:
+        try:
+            dname, dbytes = download_drive_file(fid)
+            # only keep it if it's actually a zip
+            if dbytes[:2] == b"PK" or dname.lower().endswith(".zip"):
+                zips.append((dname, dbytes))
+                print(f"    downloaded from Drive: {dname!r} ({len(dbytes)} bytes)")
+            else:
+                print(f"    (Drive file {dname!r} is not a zip — skipped)")
+        except RuntimeError as e:
+            drive_errors.append(str(e))
+            print(f"    [Drive download failed] {e}", file=sys.stderr)
+
     if not zips:
+        # Nothing to process. If a Drive link was present but failed, tell the sender.
+        if drive_errors:
+            return {"drive_error_only": True, "to_addr": sender_addr,
+                    "subject": subject, "errors": drive_errors, "msg_id": msg.get("Message-ID", "")}
         return None
 
     kaspi_rows, nokaspi_rows, flagged = [], [], []
     total_docs, excluded = 0, 0
 
     with tempfile.TemporaryDirectory() as tmp:
-        for zname, zbytes in zips:
-            zpath = os.path.join(tmp, "in.zip")
+        for idx, (zname, zbytes) in enumerate(zips):
+            zpath = os.path.join(tmp, f"in_{idx}.zip")
             with open(zpath, "wb") as f:
                 f.write(zbytes)
             try:
@@ -136,7 +270,12 @@ def process_message(raw_bytes):
                     continue
                 parts = name.split("/")
                 doc = parts[-1]
-                folder = "/".join(parts[:-1]) if len(parts) > 1 else "(root)"
+                # Folder = internal path if present, else the zip file's own name
+                # (sender sends one zip per folder, named after that folder).
+                if len(parts) > 1:
+                    folder = "/".join(parts[:-1])
+                else:
+                    folder = os.path.splitext(os.path.basename(zname))[0]
                 ext = doc.rsplit(".", 1)[-1].lower() if "." in doc else ""
 
                 if ext in EXCLUDE_EXT:
@@ -190,6 +329,28 @@ def process_message(raw_bytes):
     }
 
 
+def send_drive_error(res):
+    """Tell the sender their Drive link wasn't accessible, with the fix."""
+    body = (
+        "Hello,\n\n"
+        "We received your email but could not open the Google Drive file(s) you linked.\n\n"
+        "Most likely the file isn't shared publicly. Please fix it like this:\n"
+        "  1. In Google Drive, right-click the file → Share.\n"
+        "  2. Under 'General access', choose 'Anyone with the link'.\n"
+        "  3. Re-send the email with the link (subject must contain 'Kaspi').\n\n"
+        "Technical detail:\n - " + "\n - ".join(res["errors"]) + "\n"
+    )
+    em = EmailMessage()
+    em["From"] = GMAIL_USER
+    em["To"] = res["to_addr"]
+    em["Subject"] = "Kaspi — could not open your Drive file"
+    em.set_content(body)
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as smtp:
+        smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        smtp.send_message(em)
+
+
 # ---- Send reply ------------------------------------------------------------
 def send_reply(res):
     ok = (res["total_docs"] == res["rows_written"])
@@ -211,10 +372,8 @@ def send_reply(res):
     em = EmailMessage()
     em["From"] = GMAIL_USER
     em["To"] = res["to_addr"]
-    em["Subject"] = "Re: " + res["subject"]
-    if res["msg_id"]:
-        em["In-Reply-To"] = res["msg_id"]
-        em["References"] = res["msg_id"]
+    # Distinct subject so results don't pile into the incoming Gmail thread.
+    em["Subject"] = "Kaspi Result — " + (res["subject"] or "receipts")
     em.set_content(body)
 
     with open(res["xlsx"], "rb") as f:
@@ -238,27 +397,36 @@ def main():
     imap.login(GMAIL_USER, GMAIL_APP_PASSWORD)
     imap.select("INBOX")
 
-    # unseen emails whose subject contains the keyword
-    typ, data = imap.search(None, 'UNSEEN', 'SUBJECT', f'"{SUBJECT_KEYWORD}"')
+    # unseen emails whose subject contains the keyword.
+    # Use UIDs (stable identifiers) so threading / deletions never cause mix-ups.
+    typ, data = imap.uid('search', None, 'UNSEEN', 'SUBJECT', f'"{SUBJECT_KEYWORD}"')
     ids = data[0].split() if data and data[0] else []
-    print(f"Found {len(ids)} candidate email(s).")
+    print(f"Found {len(ids)} candidate message(s).")
 
     processed = 0
-    for num in ids:
-        typ, msg_data = imap.fetch(num, "(RFC822)")
+    for uid in ids:
+        typ, msg_data = imap.uid('fetch', uid, "(RFC822)")
+        if not msg_data or msg_data[0] is None:
+            continue
         raw = msg_data[0][1]
         try:
             res = process_message(raw)
         except Exception as e:
-            print(f"  [error] message {num!r}: {e}", file=sys.stderr)
+            print(f"  [error] message {uid!r}: {e}", file=sys.stderr)
             continue
 
         if res is None:
-            print(f"  message {num!r}: subject matched but no .zip attachment — leaving unread.")
+            print(f"  message {uid!r}: subject matched but no zip/Drive file — leaving unread.")
+            continue
+
+        if res.get("drive_error_only"):
+            send_drive_error(res)
+            imap.uid('store', uid, "+FLAGS", "\\Seen")   # notified sender; don't retry endlessly
+            print(f"  message {uid!r}: Drive link not accessible — emailed sender the fix.")
             continue
 
         send_reply(res)
-        imap.store(num, "+FLAGS", "\\Seen")   # mark done only after a successful reply
+        imap.uid('store', uid, "+FLAGS", "\\Seen")   # mark done only after a successful reply
         processed += 1
         print(f"  Replied to {res['to_addr']}: {res['total_docs']} docs, "
               f"{res['rows_written']} rows, {len(res['flagged'])} flagged.")
