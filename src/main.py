@@ -252,63 +252,81 @@ def process_message(raw_bytes):
         return None
 
     kaspi_rows, nokaspi_rows, flagged = [], [], []
-    total_docs, excluded = 0, 0
+    counters = {"total_docs": 0, "excluded": 0}
+
+    def process_one_document(folder, doc, ext, data, tmp):
+        """OCR + classify a single receipt file (bytes already in memory)."""
+        counters["total_docs"] += 1
+        fpath = os.path.join(tmp, "doc." + (ext or "bin"))
+        with open(fpath, "wb") as out:
+            out.write(data)
+        try:
+            fields, conf, has_kaspi = parse_document(fpath, is_pdf=(ext in PDF_EXT))
+        except Exception as e:
+            kaspi_rows.append([folder, doc, "", f"ERROR: {e}", "", ""])
+            flagged.append(f"{folder}/{doc}  (could not read: {e})")
+            return
+        if has_kaspi:
+            kaspi_rows.append([folder, doc, fields["date"], fields["name"],
+                               fields["amount"], fields["receiptNo"]])
+            missing = [k for k in ("date", "name", "amount", "receiptNo")
+                       if not fields[k] or conf[k] < CONF_THRESHOLD]
+            if missing:
+                flagged.append(f"{folder}/{doc}  (empty/uncertain: {', '.join(missing)})")
+        else:
+            nokaspi_rows.append([folder, doc])
+
+    def walk_zip(zbytes, base_folder, tmp, depth=0):
+        """Recursively process a zip's contents, descending into nested zips."""
+        if depth > 8:
+            return  # safety: avoid pathological deep nesting
+        zpath = os.path.join(tmp, f"z_{depth}_{len(zbytes)}.zip")
+        with open(zpath, "wb") as f:
+            f.write(zbytes)
+        try:
+            zf = zipfile.ZipFile(zpath)
+        except zipfile.BadZipFile:
+            print(f"    [could not unzip] {base_folder!r} (depth {depth})", file=sys.stderr)
+            return
+
+        for info in zf.infolist():
+            name = info.filename
+            if info.is_dir() or is_junk(name):
+                continue
+            parts = name.split("/")
+            doc = parts[-1]
+            inner_path = "/".join(parts[:-1])
+            # folder context = outer folder + any internal path within this zip
+            folder = "/".join([p for p in (base_folder, inner_path) if p]) or base_folder
+            ext = doc.rsplit(".", 1)[-1].lower() if "." in doc else ""
+
+            data = zf.read(info)
+
+            # NESTED ZIP -> recurse, using this entry's name (minus .zip) as the folder
+            if ext == "zip" or data[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08") and ext == "":
+                nested_folder = "/".join([p for p in (base_folder, inner_path,
+                                          os.path.splitext(doc)[0]) if p])
+                print(f"    entering nested zip: {name!r} -> folder {nested_folder!r}")
+                walk_zip(data, nested_folder, tmp, depth + 1)
+                continue
+
+            if ext in EXCLUDE_EXT:
+                counters["excluded"] += 1
+                continue
+            if ext not in IMAGE_EXT and ext not in PDF_EXT:
+                counters["total_docs"] += 1
+                nokaspi_rows.append([folder, doc])
+                continue
+
+            process_one_document(folder, doc, ext, data, tmp)
 
     with tempfile.TemporaryDirectory() as tmp:
         for idx, (zname, zbytes) in enumerate(zips):
-            zpath = os.path.join(tmp, f"in_{idx}.zip")
-            with open(zpath, "wb") as f:
-                f.write(zbytes)
-            try:
-                zf = zipfile.ZipFile(zpath)
-            except zipfile.BadZipFile:
-                continue
+            top_folder = os.path.splitext(os.path.basename(zname))[0]
+            walk_zip(zbytes, top_folder, tmp, depth=0)
 
-            for info in zf.infolist():
-                name = info.filename
-                if info.is_dir() or is_junk(name):
-                    continue
-                parts = name.split("/")
-                doc = parts[-1]
-                # Folder = internal path if present, else the zip file's own name
-                # (sender sends one zip per folder, named after that folder).
-                if len(parts) > 1:
-                    folder = "/".join(parts[:-1])
-                else:
-                    folder = os.path.splitext(os.path.basename(zname))[0]
-                ext = doc.rsplit(".", 1)[-1].lower() if "." in doc else ""
-
-                if ext in EXCLUDE_EXT:
-                    excluded += 1
-                    continue
-                if ext not in IMAGE_EXT and ext not in PDF_EXT:
-                    # unknown format — still count it, send to No-Kaspi for visibility
-                    total_docs += 1
-                    nokaspi_rows.append([folder, doc])
-                    continue
-
-                total_docs += 1
-                # extract this one file to disk for OCR
-                fpath = os.path.join(tmp, "doc." + ext)
-                with open(fpath, "wb") as out:
-                    out.write(zf.read(info))
-
-                try:
-                    fields, conf, has_kaspi = parse_document(fpath, is_pdf=(ext in PDF_EXT))
-                except Exception as e:
-                    kaspi_rows.append([folder, doc, "", f"ERROR: {e}", "", ""])
-                    flagged.append(f"{folder}/{doc}  (could not read: {e})")
-                    continue
-
-                if has_kaspi:
-                    kaspi_rows.append([folder, doc, fields["date"], fields["name"],
-                                       fields["amount"], fields["receiptNo"]])
-                    missing = [k for k in ("date", "name", "amount", "receiptNo")
-                               if not fields[k] or conf[k] < CONF_THRESHOLD]
-                    if missing:
-                        flagged.append(f"{folder}/{doc}  (empty/uncertain: {', '.join(missing)})")
-                else:
-                    nokaspi_rows.append([folder, doc])
+    total_docs = counters["total_docs"]
+    excluded = counters["excluded"]
 
     out_xlsx = os.path.join(tempfile.gettempdir(),
                             f"Kaspi_Result_{datetime.now():%Y%m%d_%H%M}.xlsx")
