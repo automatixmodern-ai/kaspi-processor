@@ -67,7 +67,12 @@ def _vision_text(image_bytes):
         }]
     }
     r = requests.post(f"{VISION_URL}?key={api_key}", json=payload, timeout=60)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError:
+        # Never surface the URL (it contains the API key). Report status only.
+        raise RuntimeError(f"Vision API HTTP {r.status_code} "
+                           f"({'check API enabled + billing + key restrictions' })")
     resp = r.json()["responses"][0]
     if "error" in resp and resp["error"].get("message"):
         raise RuntimeError(f"Vision API error: {resp['error']['message']}")
@@ -101,19 +106,48 @@ def _clean_amount(raw):
 
 
 def find_amount(lines):
+    def stitch_amount(idx):
+        """
+        Reconstruct the full amount from the keyword line and the lines below it,
+        even when Vision split the number across lines (common on tall, glare-
+        washed green boxes):
+            Есептелді / 15 / 000 ₸   -> 15000
+            Есептелді / 15 000 ₸     -> 15000
+            Есептелді 15 000 ₸       -> 15000
+        """
+        groups = []
+        # digits already on the keyword line (after the keyword word)
+        for tok in re.findall(r'\d+', lines[idx]):
+            groups.append(tok)
+        j = idx + 1
+        while j < len(lines) and j <= idx + 3:
+            ln = lines[j]
+            if re.search(r'Комисси|Чек|квитанц|Дата|Күн|ТМК|КНП|Kaspi|Устройств|Құрылғ', ln):
+                break
+            found = re.findall(r'\d+', ln)
+            if found:
+                groups.extend(found)
+                if re.search(r'[₸ТTт]\s*$', ln) or '\uFFFD' in ln:
+                    break            # currency glyph => number complete
+            elif not re.search(r'[₸ТTт]', ln):
+                break                # no digits, no currency => stop
+            j += 1
+        # drop a stray trailing single digit (misread ₸)
+        if len(groups) >= 2 and len(groups[-1]) == 1 and all(len(g) == 3 for g in groups[1:-1]):
+            groups = groups[:-1]
+        digits = ''.join(groups)
+        return digits if len(digits) >= 3 else ''
+
     for i, l in enumerate(lines):
         for k in AMOUNT_KEYS:
             if k in l:
-                for j in range(i, min(i + 3, len(lines))):
-                    cand = lines[j].replace(k, '') if j == i else lines[j]
-                    m = re.search(r'(\d[\d\s\u00A0]{1,}\d(?:\s+\d)?|\d{3,})', cand)
-                    if m:
-                        d = _clean_amount(m.group(1).replace('\u00A0', ' ').strip())
-                        if len(d) >= 3:
-                            return d
+                d = stitch_amount(i)
+                if d:
+                    return d
+    # fallback: the large grouped number sitting just above the commission line
     ci = next((i for i, l in enumerate(lines) if re.search(r'Комисси', l)), len(lines))
     for l in lines[:ci]:
-        m = re.search(r'(\d[\d\s\u00A0]{1,}\d(?:\s+\d)?)\s*[тТtT₸]?\s*$', l)
+        m = re.search(r'(\d[\d\s\u00A0]{1,}\d(?:\s+\d)?)\s*[тТtT₸\uFFFD]?\s*$', l)
         if m:
             d = _clean_amount(m.group(1).replace('\u00A0', ' ').strip())
             if len(d) >= 3:
