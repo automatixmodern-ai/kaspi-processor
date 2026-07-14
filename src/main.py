@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import ssl
+import time
 import zipfile
 import tempfile
 import imaplib
@@ -347,6 +348,23 @@ def process_message(raw_bytes):
     }
 
 
+def _smtp_send(em):
+    """Send an email with retries so a transient network drop doesn't lose it."""
+    ctx = ssl.create_default_context()
+    last_err = None
+    for attempt in range(3):
+        try:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=120) as smtp:
+                smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+                smtp.send_message(em)
+            return
+        except Exception as e:
+            last_err = e
+            print(f"  [warn] send attempt {attempt+1} failed: {e}", file=sys.stderr)
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"Failed to send email after retries: {last_err}")
+
+
 def send_drive_error(res):
     """Tell the sender their Drive link wasn't accessible, with the fix."""
     body = (
@@ -363,10 +381,7 @@ def send_drive_error(res):
     em["To"] = res["to_addr"]
     em["Subject"] = "Kaspi — could not open your Drive file"
     em.set_content(body)
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as smtp:
-        smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        smtp.send_message(em)
+    _smtp_send(em)
 
 
 # ---- Send reply ------------------------------------------------------------
@@ -403,30 +418,47 @@ def send_reply(res):
         )
 
     ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as smtp:
-        smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        smtp.send_message(em)
+    _smtp_send(em)
 
 
 # ---- Main ------------------------------------------------------------------
-def main():
+def _imap_connect():
     ctx = ssl.create_default_context()
     imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
     imap.login(GMAIL_USER, GMAIL_APP_PASSWORD)
     imap.select("INBOX")
+    return imap
 
-    # unseen emails whose subject contains the keyword.
-    # Use UIDs (stable identifiers) so threading / deletions never cause mix-ups.
+
+def _mark_seen(uid):
+    """Open a fresh short-lived connection just to flag one message as read."""
+    try:
+        imap = _imap_connect()
+        imap.uid('store', uid, "+FLAGS", "\\Seen")
+        imap.logout()
+    except Exception as e:
+        print(f"  [warn] could not mark {uid!r} as read: {e}", file=sys.stderr)
+
+
+def main():
+    # Phase 1: fetch all candidate raw messages quickly, then close the connection
+    # so it isn't held open (and dropped by Gmail) during long OCR processing.
+    imap = _imap_connect()
     typ, data = imap.uid('search', None, 'UNSEEN', 'SUBJECT', f'"{SUBJECT_KEYWORD}"')
     ids = data[0].split() if data and data[0] else []
     print(f"Found {len(ids)} candidate message(s).")
 
-    processed = 0
+    raw_messages = []
     for uid in ids:
         typ, msg_data = imap.uid('fetch', uid, "(RFC822)")
-        if not msg_data or msg_data[0] is None:
-            continue
-        raw = msg_data[0][1]
+        if msg_data and msg_data[0] is not None:
+            raw_messages.append((uid, msg_data[0][1]))
+    imap.logout()   # <-- connection closed BEFORE the slow work begins
+
+    # Phase 2: process each message offline (no IMAP connection held open).
+    # Reconnect only briefly (per message) to send the reply / mark it read.
+    processed = 0
+    for uid, raw in raw_messages:
         try:
             res = process_message(raw)
         except Exception as e:
@@ -439,17 +471,16 @@ def main():
 
         if res.get("drive_error_only"):
             send_drive_error(res)
-            imap.uid('store', uid, "+FLAGS", "\\Seen")   # notified sender; don't retry endlessly
+            _mark_seen(uid)   # notified sender; don't retry endlessly
             print(f"  message {uid!r}: Drive link not accessible — emailed sender the fix.")
             continue
 
         send_reply(res)
-        imap.uid('store', uid, "+FLAGS", "\\Seen")   # mark done only after a successful reply
+        _mark_seen(uid)       # mark done only after a successful reply
         processed += 1
         print(f"  Replied to {res['to_addr']}: {res['total_docs']} docs, "
               f"{res['rows_written']} rows, {len(res['flagged'])} flagged.")
 
-    imap.logout()
     print(f"Done. Processed {processed} email(s).")
 
 
