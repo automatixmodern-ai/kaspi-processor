@@ -2,7 +2,9 @@ name: Kaspi Receipt Processor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"      # every 5 minutes (UTC)
+    # GitHub cron is best-effort and throttles very frequent schedules,
+    # so we use every 10 min (honored more reliably than every 5).
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}          # manual "Run workflow" button
 
 concurrency:
